@@ -60,16 +60,33 @@ public class FunctionController {
     }
 
     @GetMapping("/dead-letters")
-    public List<ExecutionRecord> deadLetters() {
-        return runtime.deadLetters();
+    public List<ExecutionRecord> deadLetters(@RequestParam(required = false) String functionName) {
+        return functionName == null || functionName.isBlank()
+                ? runtime.deadLetters()
+                : runtime.deadLetters(functionName);
+    }
+
+    /** 重放一条死信：沿用原入参/顺序/超时/重试策略重新执行。 */
+    @PostMapping("/dead-letters/{executionId}/replay")
+    public ExecutionRecord replay(@PathVariable String executionId) {
+        return runtime.replay(executionId);
+    }
+
+    /** 死信容量淘汰事件（可观测、可解释）与累计淘汰数。 */
+    @GetMapping("/dead-letters/evictions")
+    public Map<String, Object> deadLetterEvictions() {
+        return Map.of(
+                "totalEvicted", runtime.totalEvictedDeadLetters(),
+                "recent", runtime.deadLetterEvictions());
     }
 
     /** 拒绝原因以结构化形式返回，HTTP 状态码可区分。 */
     @ExceptionHandler(InvocationRejectedException.class)
     public ResponseEntity<Map<String, Object>> rejected(InvocationRejectedException ex) {
         HttpStatus status = switch (ex.getReason()) {
-            case UNKNOWN_FUNCTION -> HttpStatus.NOT_FOUND;
+            case UNKNOWN_FUNCTION, UNKNOWN_EXECUTION -> HttpStatus.NOT_FOUND;
             case INVALID_ARGUMENT -> HttpStatus.BAD_REQUEST;
+            case NOT_REPLAYABLE -> HttpStatus.CONFLICT;
             case CONCURRENCY_LIMIT_EXCEEDED, QUEUE_FULL -> HttpStatus.TOO_MANY_REQUESTS;
         };
         return ResponseEntity.status(status).body(Map.of(

@@ -7,6 +7,8 @@ package com.github.lisama569.serverlessfunctionruntimejava.model;
  *                    -> FAILED -> DEAD_LETTERED (重试耗尽)
  *                    -> TIMED_OUT (超时中断，终态)
  * 提交阶段即被拒绝的调用进入 REJECTED（终态，不进入执行）。
+ * 死信重放：DEAD_LETTERED -> RUNNING -> SUCCEEDED（移出死信）
+ *                                -> DEAD_LETTERED（重试再次耗尽，回到死信，重放次数累计）
  */
 public enum ExecutionStatus {
     PENDING,
