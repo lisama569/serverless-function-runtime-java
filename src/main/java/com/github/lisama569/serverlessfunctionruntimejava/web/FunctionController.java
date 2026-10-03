@@ -60,8 +60,18 @@ public class FunctionController {
     }
 
     @GetMapping("/dead-letters")
-    public List<ExecutionRecord> deadLetters() {
-        return runtime.deadLetters();
+    public List<ExecutionRecord> deadLetters(@RequestParam(required = false) String functionName) {
+        return runtime.deadLetters(functionName);
+    }
+
+    /**
+     * 重放一条死信。
+     * POST /dead-letters/{executionId}/replay
+     * 成功返回重放后的执行记录；目标不在死信中返回 404，已成功终结返回 409。
+     */
+    @PostMapping("/dead-letters/{executionId}/replay")
+    public ExecutionRecord replay(@PathVariable String executionId) {
+        return runtime.replay(executionId);
     }
 
     /** 拒绝原因以结构化形式返回，HTTP 状态码可区分。 */
@@ -71,6 +81,8 @@ public class FunctionController {
             case UNKNOWN_FUNCTION -> HttpStatus.NOT_FOUND;
             case INVALID_ARGUMENT -> HttpStatus.BAD_REQUEST;
             case CONCURRENCY_LIMIT_EXCEEDED, QUEUE_FULL -> HttpStatus.TOO_MANY_REQUESTS;
+            case REPLAY_NOT_DEAD_LETTERED -> HttpStatus.NOT_FOUND;
+            case REPLAY_ALREADY_TERMINAL -> HttpStatus.CONFLICT;
         };
         return ResponseEntity.status(status).body(Map.of(
                 "reason", ex.getReason().name(),

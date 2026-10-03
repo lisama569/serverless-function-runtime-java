@@ -3,6 +3,7 @@ package com.github.lisama569.serverlessfunctionruntimejava.runtime;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -13,6 +14,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,8 +52,14 @@ public class FunctionRuntime {
     private final ConcurrentMap<String, Semaphore> orderingLocks = new ConcurrentHashMap<>();
     /** 幂等键 -> 在途执行的未来，用于重复提交等待首次执行得出结论。 */
     private final ConcurrentMap<String, CompletableFuture<ExecutionRecord>> inFlight = new ConcurrentHashMap<>();
-    /** 死信队列：重试耗尽的调用。 */
-    private final List<ExecutionRecord> deadLetters = new CopyOnWriteArrayList<>();
+    /** 死信队列：重试耗尽且未结案的调用（有容量上限，超限时最旧先淘汰）。 */
+    private final CopyOnWriteArrayList<ExecutionRecord> deadLetters = new CopyOnWriteArrayList<>();
+    /** 死信容量上限，超过时按最旧的先淘汰。 */
+    private volatile int deadLetterCapacity = 1_000;
+    /** 累计被淘汰的死信数量（可观测）。 */
+    private final AtomicLong deadLetterEvictions = new AtomicLong();
+    /** executionId -> 在途重放的未来，保证同一条死信同一时刻只有一次在途重放。 */
+    private final ConcurrentMap<String, CompletableFuture<ExecutionRecord>> replayInFlight = new ConcurrentHashMap<>();
 
     public FunctionRuntime(FunctionRegistry registry, ExecutionStore store) {
         this.registry = registry;
@@ -67,8 +75,31 @@ public class FunctionRuntime {
         this.queueWaitMillis = queueWaitMillis;
     }
 
+    /** 配置死信容量上限（>0），超限时最旧的死信先被淘汰。 */
+    public void setDeadLetterCapacity(int capacity) {
+        if (capacity <= 0) {
+            throw new IllegalArgumentException("dead letter capacity must be positive");
+        }
+        this.deadLetterCapacity = capacity;
+    }
+
+    /** 累计被淘汰的死信数量。 */
+    public long deadLetterEvictions() {
+        return deadLetterEvictions.get();
+    }
+
     public List<ExecutionRecord> deadLetters() {
         return List.copyOf(deadLetters);
+    }
+
+    /** 按函数名过滤死信（null/空白表示不过滤）。 */
+    public List<ExecutionRecord> deadLetters(String functionName) {
+        if (functionName == null || functionName.isBlank()) {
+            return deadLetters();
+        }
+        return deadLetters.stream()
+                .filter(r -> r.getFunctionName().equals(functionName))
+                .toList();
     }
 
     /**
@@ -99,12 +130,96 @@ public class FunctionRuntime {
         CompletableFuture<ExecutionRecord> completion = new CompletableFuture<>();
         inFlight.put(request.idempotencyKey(), completion);
         try {
-            executeWithOrdering(request, record, function);
+            executeWithOrdering(request, record, function, false);
         } finally {
             completion.complete(record);
             inFlight.remove(request.idempotencyKey(), completion);
         }
         return record;
+    }
+
+    /**
+     * 重放一条死信：沿用原入参、顺序约束、超时与重试策略重新执行。
+     * 成功则进入 SUCCEEDED 并移出死信；再次耗尽重试则回到死信并累计重放次数。
+     * 同一条记录同一时刻只有一次在途重放，并发/重复重放等待并返回同一结论。
+     *
+     * @throws InvocationRejectedException REPLAY_NOT_DEAD_LETTERED（不在死信中）/
+     *                                     REPLAY_ALREADY_TERMINAL（已成功终结）/
+     *                                     CONCURRENCY_LIMIT_EXCEEDED（额度不足，记录留在死信）
+     */
+    public ExecutionRecord replay(String executionId) {
+        ExecutionRecord record = store.findById(executionId)
+                .orElseThrow(() -> new InvocationRejectedException(
+                        RejectionReason.REPLAY_NOT_DEAD_LETTERED, "no such execution: " + executionId));
+        if (record.getStatus() == ExecutionStatus.SUCCEEDED) {
+            throw new InvocationRejectedException(
+                    RejectionReason.REPLAY_ALREADY_TERMINAL,
+                    "execution already succeeded, idempotencyKey=" + record.getIdempotencyKey());
+        }
+
+        // 在途重放去重：同一时刻只允许一次重放真正执行，其余等待同一结论。
+        CompletableFuture<ExecutionRecord> mine = new CompletableFuture<>();
+        CompletableFuture<ExecutionRecord> existing = replayInFlight.putIfAbsent(executionId, mine);
+        if (existing != null) {
+            log.info("duplicate replay executionId={} idempotencyKey={}", executionId, record.getIdempotencyKey());
+            try {
+                return existing.join();
+            } catch (CompletionException ce) {
+                if (ce.getCause() instanceof InvocationRejectedException rejected) {
+                    throw rejected; // 与领导方拿到同一个可区分的拒绝结论
+                }
+                throw ce;
+            }
+        }
+        try {
+            doReplay(record);
+            mine.complete(record);
+            return record;
+        } catch (InvocationRejectedException rejected) {
+            mine.completeExceptionally(rejected);
+            throw rejected;
+        } finally {
+            replayInFlight.remove(executionId, mine);
+        }
+    }
+
+    private void doReplay(ExecutionRecord record) {
+        if (!deadLetters.contains(record)) {
+            throw new InvocationRejectedException(
+                    RejectionReason.REPLAY_NOT_DEAD_LETTERED,
+                    "execution is not in dead letters, idempotencyKey=" + record.getIdempotencyKey());
+        }
+        ServerlessFunction function = registry.lookup(record.getFunctionName())
+                .orElseThrow(() -> new InvocationRejectedException(
+                        RejectionReason.UNKNOWN_FUNCTION, "unknown function: " + record.getFunctionName()));
+        // 重放不走旁路：重建原始请求，与正常调用共用同一套排序锁与并发额度。
+        InvocationRequest replayRequest = new InvocationRequest(
+                record.getFunctionName(), record.getIdempotencyKey(), record.getOrderingKey(),
+                record.getPayload(), record.getTimeoutMillis());
+        executeWithOrdering(replayRequest, record, function, true);
+        record.finishReplay(record.getStatus());
+        if (record.getStatus() == ExecutionStatus.SUCCEEDED) {
+            deadLetters.remove(record);
+            log.info("replay ok executionId={} idempotencyKey={} status={} replayCount={} (removed from dead letters)",
+                    record.getExecutionId(), record.getIdempotencyKey(),
+                    record.getStatus(), record.getReplayCount());
+        } else {
+            log.warn("replay ended executionId={} idempotencyKey={} status={} replayCount={} (stays in dead letters)",
+                    record.getExecutionId(), record.getIdempotencyKey(),
+                    record.getStatus(), record.getReplayCount());
+        }
+    }
+
+    /** 进入死信队列（幂等），超容量时最旧先淘汰；淘汰计数并打日志，记录本身仍可查询。 */
+    private void enterDeadLetters(ExecutionRecord record) {
+        deadLetters.addIfAbsent(record);
+        while (deadLetters.size() > deadLetterCapacity) {
+            ExecutionRecord evicted = deadLetters.remove(0);
+            deadLetterEvictions.incrementAndGet();
+            log.warn("dead letter evicted (capacity={}) executionId={} idempotencyKey={} status={} evictions={}",
+                    deadLetterCapacity, evicted.getExecutionId(), evicted.getIdempotencyKey(),
+                    evicted.getStatus(), deadLetterEvictions.get());
+        }
     }
 
     private void validate(InvocationRequest request) {
@@ -117,7 +232,7 @@ public class FunctionRuntime {
     }
 
     private void executeWithOrdering(InvocationRequest request, ExecutionRecord record,
-                                     ServerlessFunction function) {
+                                     ServerlessFunction function, boolean replayMode) {
         Semaphore orderingLock = null;
         boolean orderingAcquired = false;
         if (request.orderingKey() != null && !request.orderingKey().isBlank()) {
@@ -130,11 +245,24 @@ public class FunctionRuntime {
                 orderingAcquired = true;
             }
             if (!concurrencyPermits.tryAcquire(queueWaitMillis, TimeUnit.MILLISECONDS)) {
+                if (replayMode) {
+                    // 重放额度不足：明确拒绝，但记录保持 DEAD_LETTERED 且留在死信中，可稍后再次重放。
+                    log.warn("replay rejected, concurrency limit exceeded idempotencyKey={} replayCount={}",
+                            record.getIdempotencyKey(), record.getReplayCount());
+                    throw new InvocationRejectedException(RejectionReason.CONCURRENCY_LIMIT_EXCEEDED,
+                            "concurrency limit exceeded during replay, idempotencyKey=" + record.getIdempotencyKey());
+                }
                 reject(record, RejectionReason.CONCURRENCY_LIMIT_EXCEEDED,
                         "concurrency limit exceeded, idempotencyKey=" + record.getIdempotencyKey());
                 return;
             }
             permitAcquired = true;
+            if (replayMode) {
+                // 拿到额度后才计为一次真正的重放：被限流拒绝的重放不 inflate 重放次数。
+                record.beginReplay();
+                log.info("replay start executionId={} idempotencyKey={} replayCount={}",
+                        record.getExecutionId(), record.getIdempotencyKey(), record.getReplayCount());
+            }
             runWithRetries(request, record, function);
         } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -204,7 +332,7 @@ public class FunctionRuntime {
                     Thread.sleep(policy.backoffMillis());
                 } else {
                     record.transitionTo(ExecutionStatus.DEAD_LETTERED);
-                    deadLetters.add(record);
+                    enterDeadLetters(record);
                     log.error("dead lettered idempotencyKey={} status={} attempts={}",
                             record.getIdempotencyKey(), record.getStatus(), record.getAttempts());
                     return;

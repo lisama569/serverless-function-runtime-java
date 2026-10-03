@@ -12,8 +12,11 @@ public class ExecutionRecord {
     private final String idempotencyKey;
     private final String orderingKey;
     private final String payload;
+    private final long timeoutMillis;
     private volatile ExecutionStatus status;
     private volatile int attempts;
+    private volatile int replayCount;
+    private volatile ExecutionStatus lastReplayOutcome;
     private volatile String result;
     private volatile String errorMessage;
     private volatile RejectionReason rejectionReason;
@@ -26,8 +29,10 @@ public class ExecutionRecord {
         this.idempotencyKey = request.idempotencyKey();
         this.orderingKey = request.orderingKey();
         this.payload = request.payload();
+        this.timeoutMillis = request.timeoutMillis();
         this.status = ExecutionStatus.PENDING;
         this.attempts = 0;
+        this.replayCount = 0;
         this.createdAt = Instant.now();
         this.updatedAt = this.createdAt;
     }
@@ -42,13 +47,28 @@ public class ExecutionRecord {
         this.updatedAt = Instant.now();
     }
 
+    /** 重放开始：累计重放次数并重置本轮尝试计数（历史重放次数由 replayCount 保留）。 */
+    public synchronized void beginReplay() {
+        this.replayCount++;
+        this.attempts = 0;
+        this.updatedAt = Instant.now();
+    }
+
+    public synchronized void finishReplay(ExecutionStatus outcome) {
+        this.lastReplayOutcome = outcome;
+        this.updatedAt = Instant.now();
+    }
+
     public String getExecutionId() { return executionId; }
     public String getFunctionName() { return functionName; }
     public String getIdempotencyKey() { return idempotencyKey; }
     public String getOrderingKey() { return orderingKey; }
     public String getPayload() { return payload; }
+    public long getTimeoutMillis() { return timeoutMillis; }
     public ExecutionStatus getStatus() { return status; }
     public int getAttempts() { return attempts; }
+    public int getReplayCount() { return replayCount; }
+    public ExecutionStatus getLastReplayOutcome() { return lastReplayOutcome; }
     public String getResult() { return result; }
     public String getErrorMessage() { return errorMessage; }
     public RejectionReason getRejectionReason() { return rejectionReason; }
