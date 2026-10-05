@@ -9,5 +9,7 @@ public enum RejectionReason {
     /** 重放目标不在死信中（不存在、在途、或已非死信状态）。 */
     REPLAY_NOT_DEAD_LETTERED,
     /** 重放目标已成功终结，不允许重放。 */
-    REPLAY_ALREADY_TERMINAL
+    REPLAY_ALREADY_TERMINAL,
+    /** 重放目标的上一次重放以超时终结（TIMED_OUT 终态），已结案，不允许再次重放。 */
+    REPLAY_TIMED_OUT_TERMINAL
 }

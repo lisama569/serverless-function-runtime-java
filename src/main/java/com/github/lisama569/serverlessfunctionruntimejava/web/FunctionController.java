@@ -82,7 +82,7 @@ public class FunctionController {
             case INVALID_ARGUMENT -> HttpStatus.BAD_REQUEST;
             case CONCURRENCY_LIMIT_EXCEEDED, QUEUE_FULL -> HttpStatus.TOO_MANY_REQUESTS;
             case REPLAY_NOT_DEAD_LETTERED -> HttpStatus.NOT_FOUND;
-            case REPLAY_ALREADY_TERMINAL -> HttpStatus.CONFLICT;
+            case REPLAY_ALREADY_TERMINAL, REPLAY_TIMED_OUT_TERMINAL -> HttpStatus.CONFLICT;
         };
         return ResponseEntity.status(status).body(Map.of(
                 "reason", ex.getReason().name(),

@@ -54,6 +54,8 @@ public class FunctionRuntime {
     private final ConcurrentMap<String, CompletableFuture<ExecutionRecord>> inFlight = new ConcurrentHashMap<>();
     /** 死信队列：重试耗尽且未结案的调用（有容量上限，超限时最旧先淘汰）。 */
     private final CopyOnWriteArrayList<ExecutionRecord> deadLetters = new CopyOnWriteArrayList<>();
+    /** 死信入队/淘汰/移出的互斥锁：保证「先入队再按容量淘汰」整体原子，并发写入不会误淘汰未超限的记录。 */
+    private final Object deadLetterLock = new Object();
     /** 死信容量上限，超过时按最旧的先淘汰。 */
     private volatile int deadLetterCapacity = 1_000;
     /** 累计被淘汰的死信数量（可观测）。 */
@@ -156,6 +158,13 @@ public class FunctionRuntime {
                     RejectionReason.REPLAY_ALREADY_TERMINAL,
                     "execution already succeeded, idempotencyKey=" + record.getIdempotencyKey());
         }
+        if (record.getLastReplayOutcome() == ExecutionStatus.TIMED_OUT) {
+            // 上一次重放以超时终结：TIMED_OUT 是终态，记录已结案并移出死信，不得再次执行函数体。
+            throw new InvocationRejectedException(
+                    RejectionReason.REPLAY_TIMED_OUT_TERMINAL,
+                    "execution already terminated by a timed-out replay, idempotencyKey="
+                            + record.getIdempotencyKey());
+        }
 
         // 在途重放去重：同一时刻只允许一次重放真正执行，其余等待同一结论。
         CompletableFuture<ExecutionRecord> mine = new CompletableFuture<>();
@@ -199,8 +208,15 @@ public class FunctionRuntime {
         executeWithOrdering(replayRequest, record, function, true);
         record.finishReplay(record.getStatus());
         if (record.getStatus() == ExecutionStatus.SUCCEEDED) {
-            deadLetters.remove(record);
+            leaveDeadLetters(record);
             log.info("replay ok executionId={} idempotencyKey={} status={} replayCount={} (removed from dead letters)",
+                    record.getExecutionId(), record.getIdempotencyKey(),
+                    record.getStatus(), record.getReplayCount());
+        } else if (record.getStatus() == ExecutionStatus.TIMED_OUT) {
+            // 超时是终态：按结案处理，移出未结案死信；之后的重放会被 REPLAY_TIMED_OUT_TERMINAL 拒绝。
+            leaveDeadLetters(record);
+            log.warn("replay timed out executionId={} idempotencyKey={} status={} replayCount={} "
+                            + "(terminal, removed from dead letters)",
                     record.getExecutionId(), record.getIdempotencyKey(),
                     record.getStatus(), record.getReplayCount());
         } else {
@@ -210,15 +226,28 @@ public class FunctionRuntime {
         }
     }
 
-    /** 进入死信队列（幂等），超容量时最旧先淘汰；淘汰计数并打日志，记录本身仍可查询。 */
+    /**
+     * 进入死信队列（幂等），超容量时最旧先淘汰；淘汰计数并打日志，记录本身仍可查询。
+     * 入队与淘汰在同一把锁内完成：只有确实超过容量上限时才淘汰最旧记录，
+     * 并发写入不会把未超限的记录提前挤出去。
+     */
     private void enterDeadLetters(ExecutionRecord record) {
-        deadLetters.addIfAbsent(record);
-        while (deadLetters.size() > deadLetterCapacity) {
-            ExecutionRecord evicted = deadLetters.remove(0);
-            deadLetterEvictions.incrementAndGet();
-            log.warn("dead letter evicted (capacity={}) executionId={} idempotencyKey={} status={} evictions={}",
-                    deadLetterCapacity, evicted.getExecutionId(), evicted.getIdempotencyKey(),
-                    evicted.getStatus(), deadLetterEvictions.get());
+        synchronized (deadLetterLock) {
+            deadLetters.addIfAbsent(record);
+            while (deadLetters.size() > deadLetterCapacity) {
+                ExecutionRecord evicted = deadLetters.remove(0);
+                deadLetterEvictions.incrementAndGet();
+                log.warn("dead letter evicted (capacity={}) executionId={} idempotencyKey={} status={} evictions={}",
+                        deadLetterCapacity, evicted.getExecutionId(), evicted.getIdempotencyKey(),
+                        evicted.getStatus(), deadLetterEvictions.get());
+            }
+        }
+    }
+
+    /** 从未结案死信中移出（重放成功/超时结案），与入队淘汰共用同一把锁。 */
+    private void leaveDeadLetters(ExecutionRecord record) {
+        synchronized (deadLetterLock) {
+            deadLetters.remove(record);
         }
     }
 

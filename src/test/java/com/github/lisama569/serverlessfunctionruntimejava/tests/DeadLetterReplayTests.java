@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -280,6 +281,117 @@ class DeadLetterReplayTests {
         InvocationRejectedException ex = assertThrows(InvocationRejectedException.class,
                 () -> runtime.replay(r1.getExecutionId()));
         assertEquals(RejectionReason.REPLAY_NOT_DEAD_LETTERED, ex.getReason());
+    }
+
+    @Test
+    void replayEndingWithTimeoutIsTerminalAndFurtherReplayRejected() {
+        AtomicInteger calls = new AtomicInteger();
+        AtomicBoolean hang = new AtomicBoolean(false);
+        registry.register("flaky-then-hang", p -> {
+            calls.incrementAndGet();
+            if (hang.get()) {
+                try {
+                    Thread.sleep(10_000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); // 超时中断，按终态处理
+                }
+                return "unreachable";
+            }
+            throw new IllegalStateException("boom");
+        });
+
+        // 首次调用一直失败：耗尽重试进死信（100ms 超时对立即失败的尝试无影响）
+        ExecutionRecord r = runtime.invoke(new InvocationRequest("flaky-then-hang", "k-rp-to", null, null, 100));
+        logRecord("dead-lettered", r);
+        assertEquals(ExecutionStatus.DEAD_LETTERED, r.getStatus());
+        assertTrue(runtime.deadLetters().contains(r));
+
+        // 重放时函数卡住：本次重放以超时结束，必须按终结处理
+        hang.set(true);
+        ExecutionRecord replayed = runtime.replay(r.getExecutionId());
+        logRecord("replay-timed-out", replayed);
+        assertEquals(ExecutionStatus.TIMED_OUT, replayed.getStatus(), "重放以超时结束应进入超时终态");
+        assertEquals(ExecutionStatus.TIMED_OUT, replayed.getLastReplayOutcome());
+        assertEquals(1, replayed.getReplayCount());
+        assertFalse(runtime.deadLetters().contains(replayed), "超时终态不得挂在未结案死信里");
+        assertTrue(store.findById(r.getExecutionId()).isPresent(), "结案后记录本身仍可查询");
+
+        // 再次重放：必须被可区分地拒绝，函数体不得再跑、重放次数不得累计
+        int callsBefore = calls.get();
+        InvocationRejectedException ex = assertThrows(InvocationRejectedException.class,
+                () -> runtime.replay(r.getExecutionId()));
+        assertEquals(RejectionReason.REPLAY_TIMED_OUT_TERMINAL, ex.getReason());
+        log.info("[replay-after-timeout-terminal] reason={} status={} replayCount={}",
+                ex.getReason(), replayed.getStatus(), replayed.getReplayCount());
+        assertEquals(callsBefore, calls.get(), "被拒绝的重放不得再执行函数体");
+        assertEquals(1, replayed.getReplayCount(), "被拒绝的重放不得累计重放次数");
+        assertFalse(runtime.deadLetters().contains(replayed), "结案后不得重新出现在未结案死信里");
+    }
+
+    @Test
+    void concurrentDeadLetterWritesNeverEvictBelowCapacity() throws Exception {
+        final int capacity = 3;
+        final int writers = 128;
+        final int rounds = 20; // 多轮高压写入，稳定覆盖并发入队/淘汰竞态
+        for (int round = 0; round < rounds; round++) {
+            final int roundNo = round;
+            FunctionRegistry reg = new FunctionRegistry();
+            ExecutionStore st = new ExecutionStore();
+            FunctionRuntime rt = new FunctionRuntime(reg, st);
+            rt.setRetryPolicy(new RetryPolicy(1, 1, 200)); // 单次尝试即进死信，聚焦入队/淘汰并发
+            rt.setConcurrencyLimit(writers, 0); // 放行全部写入线程，避免限流拒绝干扰容量断言
+            rt.setDeadLetterCapacity(capacity);
+            // 函数体先全部阻塞在同一道闸门上，放行后同时失败：
+            // 所有写入线程几乎同一瞬间进入死信入队/淘汰，最大化并发交错。
+            CountDownLatch allParked = new CountDownLatch(writers);
+            CountDownLatch failTogether = new CountDownLatch(1);
+            reg.register("always-fail", p -> {
+                allParked.countDown();
+                try {
+                    failTogether.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+                throw new IllegalStateException("boom");
+            });
+            try {
+                CountDownLatch ready = new CountDownLatch(writers);
+                CountDownLatch go = new CountDownLatch(1);
+                List<Thread> threads = new ArrayList<>();
+                for (int i = 0; i < writers; i++) {
+                    int idx = i;
+                    Thread t = new Thread(() -> {
+                        ready.countDown();
+                        try {
+                            go.await();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                        rt.invoke(new InvocationRequest("always-fail", "k-capc-" + roundNo + "-" + idx, null, null, 0));
+                    });
+                    threads.add(t);
+                    t.start();
+                }
+                assertTrue(ready.await(5, TimeUnit.SECONDS));
+                go.countDown(); // 所有写入线程同时放行
+                assertTrue(allParked.await(5, TimeUnit.SECONDS), "所有函数体应都已就位等待放行");
+                failTogether.countDown(); // 所有尝试同一瞬间失败并涌入死信入队
+                for (Thread t : threads) {
+                    t.join();
+                }
+
+                List<ExecutionRecord> dls = rt.deadLetters();
+                log.info("[capacity-concurrent] round={} size={} evictions={} survivors={}",
+                        round, dls.size(), rt.deadLetterEvictions(),
+                        dls.stream().map(ExecutionRecord::getIdempotencyKey).toList());
+                assertEquals(capacity, dls.size(),
+                        "并发写入下死信不得掉到容量上限以下：未超限的记录不得被提前淘汰");
+                assertEquals(writers - capacity, rt.deadLetterEvictions(),
+                        "只有确实超过上限的部分才应被淘汰");
+            } finally {
+                rt.shutdown();
+            }
+        }
     }
 
     @Test
