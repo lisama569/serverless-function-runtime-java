@@ -65,7 +65,9 @@ PENDING ──► RUNNING ──► SUCCEEDED                 （成功，终态
               │                     ▼
               │                  RUNNING ──► SUCCEEDED    （重放成功，移出死信）
               │                     │
-              │                     └──────► DEAD_LETTERED（重放再次耗尽，回到死信，replayCount+1）
+              │                     ├──────► DEAD_LETTERED（重放再次耗尽，回到死信，replayCount+1）
+              │                     │
+              │                     └──────► TIMED_OUT    （重放超时，终态结案，移出死信，不得再重放）
               │
               └──────► TIMED_OUT                          （超时中断，终态，不重试）
 
@@ -109,14 +111,19 @@ runtime.replay(executionId);   // 或 POST /dead-letters/{executionId}/replay
 - **沿用原参数**：重放重建原始请求，沿用原入参、顺序键、超时与当前重试策略，
   重新走完整条执行管线（排序 → 限流 → 超时执行 → 重试/死信）。
 - **成功即结案**：重放成功进入 `SUCCEEDED` 终态，并从未结案死信列表中移除。
+- **超时同样结案**：重放以超时结束（`TIMED_OUT`）时按终态处理——超时本来就是终态，
+  记录会从未结案死信列表中移除、按终结结案，不会出现「终态记录仍挂在死信里」的
+  自相矛盾状态。此后对它再发起重放会被 `REPLAY_ALREADY_TERMINAL`（HTTP 409）
+  可区分地拒绝，函数体不会再跑一遍、`replayCount` 也不再增加。
+  （注意：从未进过死信的超时记录被重放时仍得到 `REPLAY_NOT_DEAD_LETTERED`，语义不变。）
 - **再耗尽回死信**：重放再次耗尽重试则回到 `DEAD_LETTERED` 并留在死信中；
   记录上的 `replayCount` 累计重放次数，`lastReplayOutcome` 记录最近一次重放的结果，
   死信列表与执行记录查询均可见。
 - **在途去重**：同一条记录同一时刻只允许一次在途重放。并发或重复触发的重放
   等待首个重放得出结论并返回**同一条**记录——函数体不会多跑一遍，各方结论一致。
 - **可区分的拒绝**：
-  - 目标已成功终结（`SUCCEEDED`）→ `REPLAY_ALREADY_TERMINAL`（HTTP 409）；
-  - 目标不存在或不在死信中（含已被淘汰、超时终态等）→ `REPLAY_NOT_DEAD_LETTERED`（HTTP 404）；
+  - 目标已终结（`SUCCEEDED`，或重放以 `TIMED_OUT` 终态结案）→ `REPLAY_ALREADY_TERMINAL`（HTTP 409）；
+  - 目标不存在或不在死信中（含已被淘汰、从未进死信的超时终态等）→ `REPLAY_NOT_DEAD_LETTERED`（HTTP 404）；
   - 重放时并发额度不足 → `CONCURRENCY_LIMIT_EXCEEDED`（HTTP 429），
     记录保持 `DEAD_LETTERED` 且留在死信中、不计重放次数，可稍后再次重放。
     以上拒绝都不会被悄悄当成成功。
@@ -140,6 +147,9 @@ runtime.replay(executionId);   // 或 POST /dead-letters/{executionId}/replay
   防止长时间运行后无限堆积。
 - 超过上限时**最旧的先淘汰**。每次淘汰都会打日志（被汰记录的 executionId、
   幂等键、当前容量），并累计到 `deadLetterEvictions()` 计数，淘汰行为可观测、可解释。
+- **并发写入下上限严格成立**：「入队 + 超限淘汰」在同一把锁内原子完成，
+  只有确实超过上限时才淘汰最旧的一条；未超限的记录不会因为并发写入被提前挤出去。
+  因此任意时刻都有 `死信数 ≤ 容量`，且 `淘汰计数 == 累计入队数 - 当前死信数`。
 - 淘汰只把记录移出「未结案死信列表」，**不删除执行记录**：仍可按执行 ID / 幂等键
   查询到该记录（状态保持 `DEAD_LETTERED`），查询语义不变；对已被淘汰的记录发起
   重放会得到 `REPLAY_NOT_DEAD_LETTERED` 的明确拒绝。
@@ -170,11 +180,14 @@ mvn test
 |---|---|
 | `replaySucceedsMovesToTerminalAndLeavesDeadLetter` | 重放成功 → `SUCCEEDED`，移出死信，`replayCount=1` |
 | `replayReExhaustionReturnsToDeadLetterAndCountsReplays` | 重放再耗尽 → 回死信，重放次数累计，无重复条目 |
+| `replayEndingWithTimeoutIsTerminalAndFurtherReplayRejected` | 重放超时 → `TIMED_OUT` 终态结案、移出死信；再重放 → `REPLAY_ALREADY_TERMINAL`，函数体不再执行 |
 | `concurrentReplayExecutesBodyOnceWithSameConclusion` | 并发重放：函数体只多跑一次，各方结论一致 |
 | `replayOfNonDeadLetterOrTerminalIsRejectedDistinguishably` | 不存在/非死信 → `REPLAY_NOT_DEAD_LETTERED`；已终结 → `REPLAY_ALREADY_TERMINAL` |
 | `replayRespectsConcurrencyLimitAndKeepsRecordInDeadLetters` | 额度不足 → 明确拒绝，记录留死信、不计重放次数、不执行函数体 |
 | `replayTakesEffectInSubmissionOrderOnSameOrderingKey` | 重放与正常调用在同一顺序键上按提交顺序生效 |
 | `deadLetterCapacityEvictsOldestObservably` | 超容量最旧先淘汰，淘汰计数可观测，记录仍可查询，重放被拒可区分 |
+| `concurrentDeadLetterWritesNeverEvictBelowCapacity` | 并发写入未超限：一条不淘汰、计数为 0 |
+| `concurrentDeadLetterWritesRespectCapacityStrictly` | 高并发反复写入：死信数严格等于容量上限，淘汰数 == 入队数 - 容量 |
 | `deadLettersCanBeFilteredByFunctionName` | 死信列表按函数名过滤 |
 
 ### 开箱即用的端到端链路

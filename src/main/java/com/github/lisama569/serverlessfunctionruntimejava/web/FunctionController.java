@@ -67,7 +67,7 @@ public class FunctionController {
     /**
      * 重放一条死信。
      * POST /dead-letters/{executionId}/replay
-     * 成功返回重放后的执行记录；目标不在死信中返回 404，已成功终结返回 409。
+     * 成功返回重放后的执行记录；目标不在死信中返回 404，已终结（成功或重放超时结案）返回 409。
      */
     @PostMapping("/dead-letters/{executionId}/replay")
     public ExecutionRecord replay(@PathVariable String executionId) {

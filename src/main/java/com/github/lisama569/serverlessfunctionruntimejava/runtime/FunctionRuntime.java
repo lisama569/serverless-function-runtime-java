@@ -54,6 +54,8 @@ public class FunctionRuntime {
     private final ConcurrentMap<String, CompletableFuture<ExecutionRecord>> inFlight = new ConcurrentHashMap<>();
     /** 死信队列：重试耗尽且未结案的调用（有容量上限，超限时最旧先淘汰）。 */
     private final CopyOnWriteArrayList<ExecutionRecord> deadLetters = new CopyOnWriteArrayList<>();
+    /** 死信写入与淘汰的互斥锁：保证「入队 + 超限淘汰」整体原子，容量上限在并发下严格成立。 */
+    private final Object deadLetterLock = new Object();
     /** 死信容量上限，超过时按最旧的先淘汰。 */
     private volatile int deadLetterCapacity = 1_000;
     /** 累计被淘汰的死信数量（可观测）。 */
@@ -140,11 +142,12 @@ public class FunctionRuntime {
 
     /**
      * 重放一条死信：沿用原入参、顺序约束、超时与重试策略重新执行。
-     * 成功则进入 SUCCEEDED 并移出死信；再次耗尽重试则回到死信并累计重放次数。
+     * 成功则进入 SUCCEEDED 并移出死信；以超时结束同样按终态处理并移出死信；
+     * 再次耗尽重试则回到死信并累计重放次数。
      * 同一条记录同一时刻只有一次在途重放，并发/重复重放等待并返回同一结论。
      *
      * @throws InvocationRejectedException REPLAY_NOT_DEAD_LETTERED（不在死信中）/
-     *                                     REPLAY_ALREADY_TERMINAL（已成功终结）/
+     *                                     REPLAY_ALREADY_TERMINAL（已成功终结，或重放以超时终态结束）/
      *                                     CONCURRENCY_LIMIT_EXCEEDED（额度不足，记录留在死信）
      */
     public ExecutionRecord replay(String executionId) {
@@ -155,6 +158,14 @@ public class FunctionRuntime {
             throw new InvocationRejectedException(
                     RejectionReason.REPLAY_ALREADY_TERMINAL,
                     "execution already succeeded, idempotencyKey=" + record.getIdempotencyKey());
+        }
+        if (record.getStatus() == ExecutionStatus.TIMED_OUT
+                && record.getLastReplayOutcome() == ExecutionStatus.TIMED_OUT) {
+            // 重放以超时结束即按终结处理：已移出未结案死信，之后不得再被重放。
+            // （从未进过死信的超时记录走下方 REPLAY_NOT_DEAD_LETTERED 分支，语义不变。）
+            throw new InvocationRejectedException(
+                    RejectionReason.REPLAY_ALREADY_TERMINAL,
+                    "execution terminated by replay timeout, idempotencyKey=" + record.getIdempotencyKey());
         }
 
         // 在途重放去重：同一时刻只允许一次重放真正执行，其余等待同一结论。
@@ -203,6 +214,13 @@ public class FunctionRuntime {
             log.info("replay ok executionId={} idempotencyKey={} status={} replayCount={} (removed from dead letters)",
                     record.getExecutionId(), record.getIdempotencyKey(),
                     record.getStatus(), record.getReplayCount());
+        } else if (record.getStatus() == ExecutionStatus.TIMED_OUT) {
+            // 超时即终态：按终结处理，移出未结案死信，之后不得再被重放，
+            // 避免「终态记录仍挂在死信里、还能被反复重放」的自相矛盾状态。
+            deadLetters.remove(record);
+            log.warn("replay timed out, closed as terminal executionId={} idempotencyKey={} status={} replayCount={} (removed from dead letters)",
+                    record.getExecutionId(), record.getIdempotencyKey(),
+                    record.getStatus(), record.getReplayCount());
         } else {
             log.warn("replay ended executionId={} idempotencyKey={} status={} replayCount={} (stays in dead letters)",
                     record.getExecutionId(), record.getIdempotencyKey(),
@@ -210,15 +228,21 @@ public class FunctionRuntime {
         }
     }
 
-    /** 进入死信队列（幂等），超容量时最旧先淘汰；淘汰计数并打日志，记录本身仍可查询。 */
+    /**
+     * 进入死信队列（幂等），超容量时最旧先淘汰；淘汰计数并打日志，记录本身仍可查询。
+     * 入队与淘汰在同一把锁内完成：只有确实超过上限才淘汰最旧的一条，
+     * 并发写入不会把未超限的记录提前挤出去（容量上限严格成立）。
+     */
     private void enterDeadLetters(ExecutionRecord record) {
-        deadLetters.addIfAbsent(record);
-        while (deadLetters.size() > deadLetterCapacity) {
-            ExecutionRecord evicted = deadLetters.remove(0);
-            deadLetterEvictions.incrementAndGet();
-            log.warn("dead letter evicted (capacity={}) executionId={} idempotencyKey={} status={} evictions={}",
-                    deadLetterCapacity, evicted.getExecutionId(), evicted.getIdempotencyKey(),
-                    evicted.getStatus(), deadLetterEvictions.get());
+        synchronized (deadLetterLock) {
+            deadLetters.addIfAbsent(record);
+            while (deadLetters.size() > deadLetterCapacity) {
+                ExecutionRecord evicted = deadLetters.remove(0);
+                deadLetterEvictions.incrementAndGet();
+                log.warn("dead letter evicted (capacity={}) executionId={} idempotencyKey={} status={} evictions={}",
+                        deadLetterCapacity, evicted.getExecutionId(), evicted.getIdempotencyKey(),
+                        evicted.getStatus(), deadLetterEvictions.get());
+            }
         }
     }
 

@@ -8,6 +8,6 @@ public enum RejectionReason {
     QUEUE_FULL,
     /** 重放目标不在死信中（不存在、在途、或已非死信状态）。 */
     REPLAY_NOT_DEAD_LETTERED,
-    /** 重放目标已成功终结，不允许重放。 */
+    /** 重放目标已终结（成功，或重放以超时终态结束），不允许重放。 */
     REPLAY_ALREADY_TERMINAL
 }
